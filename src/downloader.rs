@@ -205,7 +205,9 @@ impl HttpDownloader {
 
         spawn_blocking(move || {
             let mut bytes_read = 0u64;
+            let aborted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+            let callback_aborted = aborted.clone();
             let result = http
                 .get(&url)
                 .send_with_callback(|chunk| {
@@ -221,16 +223,25 @@ impl HttpDownloader {
                     });
 
                     // Backpressure: block until the consumer drains a slot.
-                    // An error means the consumer dropped the stream.
-                    chunk_tx.blocking_send(chunk).map_err(|_| {
-                        impersonate_rs::Error::Impersonate(
+                    // An error means the consumer dropped the stream; abort
+                    // the curl transfer so we stop pulling bytes.
+                    if chunk_tx.blocking_send(chunk).is_err() {
+                        callback_aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return Err(impersonate_rs::Error::Impersonate(
                             "upload consumer went away, aborting track stream".into(),
-                        )
-                    })
+                        ));
+                    }
+                    Ok(())
                 });
 
-            if let Err(err) = result {
-                log::error!("failed to stream track: {err:#}");
+            match result {
+                // The consumer went away (e.g. an upload error): the abort is
+                // expected cleanup, not a download failure.
+                Err(_) if aborted.load(std::sync::atomic::Ordering::Relaxed) => {
+                    log::debug!("track stream aborted: upload consumer went away");
+                }
+                Err(err) => log::error!("failed to stream track: {err:#}"),
+                Ok(_) => {}
             }
             // Dropping chunk_tx signals EOF to the upload reader.
         })

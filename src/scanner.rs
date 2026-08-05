@@ -34,6 +34,13 @@ pub async fn run(config: Config, state: Arc<AppState>, client: TgClient) -> Resu
 
     if peer.is_none() {
         log::warn!("neither TELEGRAM_CHANNEL nor TELEGRAM_CHAT_ID is set; new releases will be marked seen but not sent anywhere");
+    } else {
+        if let Err(err) = client
+            .send_message(peer.as_ref().unwrap(), startup_summary(&config))
+            .await
+        {
+            log::error!("failed to post startup message: {err:#}");
+        }
     }
 
     loop {
@@ -54,6 +61,30 @@ pub async fn run(config: Config, state: Arc<AppState>, client: TgClient) -> Resu
     }
 }
 
+/// Text posted to the channel on startup describing the current configuration.
+fn startup_summary(config: &Config) -> String {
+    let tags = if config.bandcamp_tags.is_empty() {
+        "—".to_string()
+    } else {
+        config.bandcamp_tags.join(", ")
+    };
+    let blacklist = if config.bandcamp_tag_blacklist.is_empty() {
+        "—".to_string()
+    } else {
+        config.bandcamp_tag_blacklist.join(", ")
+    };
+    let artists = if config.bandcamp_artists.is_empty() {
+        "—".to_string()
+    } else {
+        config.bandcamp_artists.join(", ")
+    };
+
+    format!(
+        "Бот запущен.\nТеги: {tags}\nАртисты: {artists}\nБлэклист: {blacklist}\nОпрос каждые {} с",
+        config.poll_interval.as_secs()
+    )
+}
+
 /// One pass over every configured tag and artist, streaming new releases to Telegram.
 pub async fn scan_round(
     client: &TgClient,
@@ -65,18 +96,27 @@ pub async fn scan_round(
 
     for tag in &config.bandcamp_tags {
         log::info!("scanning tag '{tag}'");
-        let releases = state.bandcamp.discover(&[tag.clone()], "new").await?;
+        let releases = match state.bandcamp.discover(&[tag.clone()], "new").await {
+            Ok(releases) => releases,
+            Err(err) => {
+                log::error!("failed to scan tag '{tag}': {err:#}");
+                continue;
+            }
+        };
         for release in releases {
             report.found += 1;
-            match process_release(client, state, config, &release.url, peer).await? {
-                ReleaseAction::Seen => {}
-                ReleaseAction::Blacklisted => {
+            match process_release(client, state, config, &release.url, peer).await {
+                Ok(ReleaseAction::Seen) => {}
+                Ok(ReleaseAction::Blacklisted) => {
                     report.new += 1;
                     report.skipped += 1;
                 }
-                ReleaseAction::Posted => {
+                Ok(ReleaseAction::Posted) => {
                     report.new += 1;
                     report.uploaded += 1;
+                }
+                Err(err) => {
+                    log::error!("failed to process {}: {err:#}", release.url);
                 }
             }
         }
@@ -84,18 +124,27 @@ pub async fn scan_round(
 
     for artist in &config.bandcamp_artists {
         log::info!("scanning artist '{artist}'");
-        let releases = state.bandcamp.artist_releases(artist).await?;
+        let releases = match state.bandcamp.artist_releases(artist).await {
+            Ok(releases) => releases,
+            Err(err) => {
+                log::error!("failed to scan artist '{artist}': {err:#}");
+                continue;
+            }
+        };
         for release in releases {
             report.found += 1;
-            match process_release(client, state, config, &release.url, peer).await? {
-                ReleaseAction::Seen => {}
-                ReleaseAction::Blacklisted => {
+            match process_release(client, state, config, &release.url, peer).await {
+                Ok(ReleaseAction::Seen) => {}
+                Ok(ReleaseAction::Blacklisted) => {
                     report.new += 1;
                     report.skipped += 1;
                 }
-                ReleaseAction::Posted => {
+                Ok(ReleaseAction::Posted) => {
                     report.new += 1;
                     report.uploaded += 1;
+                }
+                Err(err) => {
+                    log::error!("failed to process {}: {err:#}", release.url);
                 }
             }
         }

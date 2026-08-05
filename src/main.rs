@@ -72,21 +72,23 @@ async fn supervise(config: config::Config, state: Arc<bot::AppState>) -> Result<
                 log::info!("shutting down");
                 scan_task.abort();
                 bot_task.abort();
+                let _ = scan_task.await;
+                let _ = bot_task.await;
                 return Ok(());
             }
             result = &mut scan_task => {
-                bot_task.abort();
                 log::error!("scanner exited unexpectedly: {result:?}");
+                // scan_task already completed; only wait for the aborted bot.
+                bot_task.abort();
+                let _ = bot_task.await;
             }
             result = &mut bot_task => {
-                scan_task.abort();
                 log::error!("bot exited unexpectedly: {result:?}");
+                // bot_task already completed; only wait for the aborted scanner.
+                scan_task.abort();
+                let _ = scan_task.await;
             }
         }
-
-        // Make sure both tasks have fully stopped before reconnecting.
-        let _ = scan_task.await;
-        let _ = bot_task.await;
 
         log::warn!("restarting in {}s", RECONNECT_DELAY.as_secs());
         sleep(RECONNECT_DELAY).await;
