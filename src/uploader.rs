@@ -1,4 +1,3 @@
-use std::io::{self, Read};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -10,7 +9,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::bandcamp::Album;
-use crate::downloader::DownloadedAlbum;
+use crate::downloader::AlbumStream;
 use crate::progress::{ProgressEvent, ProgressSink, Stage};
 use crate::tg::{InputMedia, Peer, TgClient};
 
@@ -23,15 +22,15 @@ pub struct UploadResult {
     pub sent_files: usize,
 }
 
-/// Sends an in-memory downloaded album into a Telegram chat.
+/// Uploads an album streamed from the downloader (consumer side of the pipeline).
 #[async_trait]
 pub trait Uploader: Send + Sync {
     async fn upload(
         &self,
         client: &TgClient,
         peer: &Peer,
-        downloaded: &DownloadedAlbum,
-        progress: &dyn ProgressSink,
+        stream: AlbumStream,
+        progress: Arc<dyn ProgressSink>,
     ) -> Result<UploadResult>;
 }
 
@@ -45,16 +44,20 @@ impl Uploader for NoopUploader {
         &self,
         _client: &TgClient,
         peer: &Peer,
-        downloaded: &DownloadedAlbum,
-        _progress: &dyn ProgressSink,
+        stream: AlbumStream,
+        _progress: Arc<dyn ProgressSink>,
     ) -> Result<UploadResult> {
         log::info!(
             "[noop] would upload {} track(s) of '{} - {}' to chat {}",
-            downloaded.tracks.len(),
-            downloaded.album.artist,
-            downloaded.album.title,
+            stream.album.tracks.len(),
+            stream.album.artist,
+            stream.album.title,
             peer.id()
         );
+
+        // Drain the channel so the producer does not block forever.
+        let mut tracks = stream.tracks;
+        while tracks.recv().await.is_some() {}
 
         Ok(UploadResult { sent_files: 0 })
     }
@@ -63,7 +66,9 @@ impl Uploader for NoopUploader {
 /// Real uploader: posts the cover photo with the album summary as its caption,
 /// then every track as audio media groups (one Telegram message per group of
 /// up to 10 tracks). The cover art is also downscaled and attached as a
-/// thumbnail to each track.
+/// thumbnail to each track. Each track's audio is read chunk-by-chunk from the
+/// producer's channel and fed straight into Telegram, so only a few chunks are
+/// in memory regardless of track length.
 #[derive(Debug, Default)]
 pub struct TelegramUploader;
 
@@ -73,15 +78,15 @@ impl Uploader for TelegramUploader {
         &self,
         client: &TgClient,
         peer: &Peer,
-        downloaded: &DownloadedAlbum,
-        progress: &dyn ProgressSink,
+        stream: AlbumStream,
+        progress: Arc<dyn ProgressSink>,
     ) -> Result<UploadResult> {
-        let album = &downloaded.album;
+        let album = &stream.album;
         let summary = album_summary(album);
         let mut sent_files = 0;
 
         // Send cover photo with caption
-        match &downloaded.cover {
+        match &stream.cover {
             Some(cover) => {
                 client.send_photo(peer, cover.clone(), summary).await?;
                 sent_files += 1;
@@ -97,12 +102,8 @@ impl Uploader for TelegramUploader {
             }
         }
 
-        if downloaded.tracks.is_empty() {
-            return Ok(UploadResult { sent_files });
-        }
-
         // Upload thumbnail once
-        let thumbnail = match downloaded.cover.as_deref().and_then(cover_thumbnail) {
+        let thumbnail = match stream.cover.as_deref().and_then(cover_thumbnail) {
             Some(thumb_bytes) => {
                 let uploaded = client
                     .inner()
@@ -115,7 +116,7 @@ impl Uploader for TelegramUploader {
                 Some(uploaded)
             }
             None => {
-                if downloaded.cover.is_some() {
+                if stream.cover.is_some() {
                     log::warn!(
                         "could not downscale cover for '{} - {}', posting without thumbnails",
                         album.artist,
@@ -126,104 +127,117 @@ impl Uploader for TelegramUploader {
             }
         };
 
-        // Process tracks in groups of 10
-        let total_tracks = downloaded.tracks.len();
-        for (chunk_idx, chunk) in downloaded.tracks.chunks(MEDIA_GROUP_MAX).enumerate() {
-            let mut media = Vec::new();
+        // Process tracks in groups of 10 as they arrive from the producer.
+        let mut tracks = stream.tracks;
+        let mut media: Vec<InputMedia> = Vec::new();
+        let mut track_index = 0usize;
+        let total_tracks = album.tracks.len();
 
-            for (idx, track) in chunk.iter().enumerate() {
-                let track_num = chunk_idx * MEDIA_GROUP_MAX + idx + 1;
-                let total_bytes = track.data.len() as u64;
+        while let Some(track) = tracks.recv().await {
+            track_index += 1;
+            let track_size = track.size;
 
-                // A counting reader drives an atomic counter; a small reporter
-                // task forwards progress events over a channel, and this task
-                // forwards them while the upload runs (raw pointers are not Send).
-                let bytes_uploaded = Arc::new(AtomicU64::new(0));
-                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProgressEvent>();
+            // A counting reader drives an atomic counter; a small reporter
+            // task forwards progress events over a channel, and this task
+            // forwards them while the upload runs (raw pointers are not Send).
+            let bytes_uploaded = Arc::new(AtomicU64::new(0));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProgressEvent>();
 
-                let reporter = {
-                    let counter = bytes_uploaded.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                            let bytes = counter.load(Ordering::Relaxed);
+            let reporter = {
+                let counter = bytes_uploaded.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        let bytes = counter.load(Ordering::Relaxed);
 
-                            if tx
-                                .send(ProgressEvent {
-                                    stage: Stage::Upload,
-                                    track_num,
-                                    total_tracks,
-                                    bytes,
-                                    total_bytes,
-                                })
-                                .is_err()
-                            {
-                                break;
-                            }
-
-                            if bytes >= total_bytes {
-                                break;
-                            }
+                        if tx
+                            .send(ProgressEvent {
+                                stage: Stage::Upload,
+                                track_num: track_index,
+                                total_tracks,
+                                bytes,
+                                total_bytes: track_size,
+                            })
+                            .is_err()
+                        {
+                            break;
                         }
-                    })
-                };
 
-                let mut counting_reader = CountingReader {
-                    inner: std::io::Cursor::new(track.data.clone()),
-                    counter: bytes_uploaded.clone(),
-                };
-
-                let filename = format!("{:02}. {}.mp3", track.num, track.title);
-                let mut upload_fut = Box::pin(client.inner().upload_stream(
-                    &mut counting_reader,
-                    track.data.len(),
-                    filename.clone(),
-                ));
-
-                let uploaded = loop {
-                    tokio::select! {
-                        event = rx.recv() => match event {
-                            Some(event) => progress.report(event),
-                            None => break upload_fut.await,
-                        },
-                        result = &mut upload_fut => break result,
+                        if bytes >= track_size {
+                            break;
+                        }
                     }
-                };
-                let uploaded = uploaded.context("failed to upload track")?;
+                })
+            };
 
-                reporter.abort();
+            let mut counting_reader = CountingReader {
+                inner: track.reader,
+                counter: bytes_uploaded.clone(),
+            };
 
-                // Create InputMedia with audio attributes
-                let input = InputMedia::audio(
-                    uploaded,
-                    format!("{}. {}", track.num, track.title),
-                    album.artist.clone(),
-                    thumbnail.clone(),
-                );
+            let filename = format!("{:02}. {}.mp3", track.num, track.title);
+            let mut upload_fut = Box::pin(client.inner().upload_stream(
+                &mut counting_reader,
+                track_size as usize,
+                filename.clone(),
+            ));
 
-                media.push(input);
-                sent_files += 1;
+            let uploaded = loop {
+                tokio::select! {
+                    event = rx.recv() => match event {
+                        Some(event) => progress.report(event),
+                        None => break upload_fut.await,
+                    },
+                    result = &mut upload_fut => break result,
+                }
+            };
+            let uploaded = uploaded.context("failed to upload track")?;
 
+            reporter.abort();
+
+            // Create InputMedia with audio attributes
+            let input = InputMedia::audio(
+                uploaded,
+                format!("{}. {}", track.num, track.title),
+                album.artist.clone(),
+                thumbnail.clone(),
+            );
+
+            media.push(input);
+            sent_files += 1;
+
+            log::info!(
+                "uploaded track {} of '{} - {}' ({} bytes)",
+                track.num,
+                album.artist,
+                album.title,
+                track_size,
+            );
+
+            if media.len() == MEDIA_GROUP_MAX {
+                client.send_album(peer, std::mem::take(&mut media)).await?;
                 log::info!(
-                    "uploaded track {} of '{} - {}' ({} bytes)",
-                    track.num,
+                    "posted {} track(s) of '{} - {}' to chat {}",
+                    MEDIA_GROUP_MAX,
                     album.artist,
                     album.title,
-                    track.data.len(),
+                    peer.id()
                 );
-            }
 
-            // Send media group
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+
+        if !media.is_empty() {
+            let count = media.len();
             client.send_album(peer, media).await?;
             log::info!(
                 "posted {} track(s) of '{} - {}' to chat {}",
-                chunk.len(),
+                count,
                 album.artist,
                 album.title,
                 peer.id()
             );
-
-            tokio::time::sleep(Duration::from_millis(300)).await;
         }
 
         Ok(UploadResult { sent_files })
@@ -236,29 +250,20 @@ struct CountingReader<R> {
     counter: Arc<AtomicU64>,
 }
 
-impl<R: Read> Read for CountingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.counter.fetch_add(n as u64, Ordering::Relaxed);
-        Ok(n)
-    }
-}
-
-impl<R: Read + Unpin> AsyncRead for CountingReader<R> {
+impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let unfilled = buf.initialize_unfilled();
-        match self.inner.read(unfilled) {
-            Ok(n) => {
-                self.counter.fetch_add(n as u64, Ordering::Relaxed);
-                buf.advance(n);
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                let read = buf.filled().len() - before;
+                self.counter.fetch_add(read as u64, Ordering::Relaxed);
                 Poll::Ready(Ok(()))
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
-            Err(e) => Poll::Ready(Err(e)),
+            other => other,
         }
     }
 }

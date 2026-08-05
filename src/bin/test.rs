@@ -183,26 +183,33 @@ async fn test_pipeline(client: &BandcampClient) -> Result<()> {
 
     let downloader = HttpDownloader::new();
     let uploader = TelegramUploader::default();
-    let progress = NoopProgressSink;
+    let progress: std::sync::Arc<dyn telecamp::progress::ProgressSink> =
+        std::sync::Arc::new(NoopProgressSink);
 
-    let downloaded = downloader.download(&album, &progress).await?;
+    let stream = downloader.stream(&album, progress.clone()).await?;
+
+    // Drain each track's stream reader to verify it actually yields payload.
+    let mut tracks = Vec::new();
+    let mut total: usize = 0;
+    let mut stream = stream;
+    while let Some(mut track) = stream.tracks.recv().await {
+        use tokio::io::AsyncReadExt;
+        let mut data = Vec::new();
+        track.reader.read_to_end(&mut data).await?;
+        total += data.len();
+        tracks.push((track.num, track.title.clone(), data.len()));
+    }
+
+    check(!tracks.is_empty(), "http downloader fetched at least one track")?;
     check(
-        !downloaded.tracks.is_empty(),
-        "http downloader fetched at least one track",
-    )?;
-    check(
-        downloaded
-            .tracks
-            .iter()
-            .all(|track| !track.data.is_empty()),
+        tracks.iter().all(|(_, _, len)| *len > 0),
         "every fetched track has payload bytes",
     )?;
-    let total: usize = downloaded.tracks.iter().map(|track| track.data.len()).sum();
     println!(
         "  streamed {} track(s), {} bytes total, cover={}",
-        downloaded.tracks.len(),
+        tracks.len(),
         total,
-        downloaded.cover.as_ref().map_or(0, Vec::len),
+        stream.cover.as_ref().map_or(0, Vec::len),
     );
 
     let config = match telecamp::config::Config::from_env() {
@@ -222,8 +229,9 @@ async fn test_pipeline(client: &BandcampClient) -> Result<()> {
     };
     match tg_client.resolve_chat(&config).await? {
         Some(peer) => {
+            let stream = downloader.stream(&album, progress.clone()).await?;
             let result = uploader
-                .upload(&tg_client, &peer, &downloaded, &progress)
+                .upload(&tg_client, &peer, stream, progress.clone())
                 .await?;
             check(result.sent_files > 0, "uploader sent at least one file")?;
             println!("  uploaded {} file(s) to chat {}", result.sent_files, peer.id());

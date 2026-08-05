@@ -158,13 +158,13 @@ async fn handle_album(
         .await?;
 
     // Use noop progress for interactive mode (no progress message)
-    let progress = NoopProgressSink;
+    let progress: Arc<dyn crate::progress::ProgressSink> = Arc::new(NoopProgressSink);
 
-    match state.downloader.download(&album, &progress).await {
-        Ok(downloaded) => {
+    match state.downloader.stream(&album, progress.clone()).await {
+        Ok(stream) => {
             match state
                 .uploader
-                .upload(&client, peer, &downloaded, &progress)
+                .upload(&client, peer, stream, progress.clone())
                 .await
             {
                 Ok(result) => {

@@ -145,14 +145,15 @@ async fn process_release(
 
     // Progress is intentionally disabled: per-event edits spam the chat and
     // trip Telegram's flood limits (FLOOD_WAIT on editMessage).
-    let progress = NoopProgressSink;
+    let progress: Arc<dyn crate::progress::ProgressSink> = Arc::new(NoopProgressSink);
 
-    // Download with progress
-    let downloaded = state.downloader.download(&album, &progress).await?;
+    // Producer/consumer: the downloader streams tracks into a bounded channel
+    // while the uploader consumes and posts them one at a time.
+    let stream = state.downloader.stream(&album, progress.clone()).await?;
 
     state
         .uploader
-        .upload(client, peer, &downloaded, &progress)
+        .upload(client, peer, stream, progress.clone())
         .await?;
 
     // Mark as seen
