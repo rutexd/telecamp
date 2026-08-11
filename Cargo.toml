@@ -7,6 +7,7 @@ default-run = "telecamp"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
 env_logger = "0.11"
 image = { version = "0.24", default-features = false, features = ["jpeg"] }

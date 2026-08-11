@@ -231,7 +231,7 @@ async fn test_pipeline(client: &BandcampClient) -> Result<()> {
         Some(peer) => {
             let stream = downloader.stream(&album, progress.clone()).await?;
             let result = uploader
-                .upload(&tg_client, &peer, stream, progress.clone())
+                .upload(&tg_client, &peer, stream, progress.clone(), None)
                 .await?;
             check(result.sent_files > 0, "uploader sent at least one file")?;
             println!("  uploaded {} file(s) to chat {}", result.sent_files, peer.id());

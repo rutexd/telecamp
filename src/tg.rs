@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Context, Result};
 use grammers_client::client::{UpdateStream, UpdatesConfiguration};
 use grammers_client::media::{InputMedia as GInputMedia, Uploaded};
-use grammers_client::message::{InputMessage, Message as GMessage};
+use grammers_client::message::{InputMessage, Message as GMessage, ReplyMarkup};
 use grammers_client::peer::Peer as GPeer;
 use grammers_client::{Client, SenderPool};
 use grammers_session::types::PeerRef;
@@ -120,12 +120,14 @@ impl TgClient {
         Ok(Message { inner: msg })
     }
 
-    /// Sends a photo with caption to a peer.
+    /// Sends a photo with caption to a peer. `markup` attaches an inline
+    /// keyboard (like/dislike buttons) to the message when provided.
     pub async fn send_photo(
         &self,
         peer: &Peer,
         photo_bytes: Vec<u8>,
         caption: impl Into<String>,
+        markup: Option<ReplyMarkup>,
     ) -> Result<Message> {
         let peer_ref = to_peer_ref(peer).await?;
 
@@ -140,11 +142,39 @@ impl TgClient {
             .await
             .context("failed to upload photo")?;
 
+        let mut input = InputMessage::new().text(caption).photo(uploaded);
+        if let Some(markup) = markup {
+            input = input.reply_markup(markup);
+        }
+
         let msg = self
             .client
-            .send_message(peer_ref, InputMessage::new().text(caption).photo(uploaded))
+            .send_message(peer_ref, input)
             .await
             .context("failed to send photo")?;
+
+        Ok(Message { inner: msg })
+    }
+
+    /// Sends a text message with an inline keyboard.
+    pub async fn send_message_markup(
+        &self,
+        peer: &Peer,
+        text: impl Into<String>,
+        markup: Option<ReplyMarkup>,
+    ) -> Result<Message> {
+        let peer_ref = to_peer_ref(peer).await?;
+
+        let mut input = InputMessage::new().text(text.into());
+        if let Some(markup) = markup {
+            input = input.reply_markup(markup);
+        }
+
+        let msg = self
+            .client
+            .send_message(peer_ref, input)
+            .await
+            .context("failed to send message")?;
 
         Ok(Message { inner: msg })
     }
@@ -182,6 +212,111 @@ impl TgClient {
             .context("failed to edit message")?;
 
         Ok(())
+    }
+
+    /// Edits a message's text and inline keyboard.
+    pub async fn edit_message_markup(
+        &self,
+        peer: &Peer,
+        message_id: i32,
+        new_text: impl Into<String>,
+        markup: Option<ReplyMarkup>,
+    ) -> Result<()> {
+        let peer_ref = to_peer_ref(peer).await?;
+
+        let mut input = InputMessage::new().text(new_text.into());
+        if let Some(markup) = markup {
+            input = input.reply_markup(markup);
+        }
+
+        self.client
+            .edit_message(peer_ref, message_id, input)
+            .await
+            .context("failed to edit message")?;
+
+        Ok(())
+    }
+
+    /// Forwards messages from `source` into `destination`.
+    pub async fn forward_messages(
+        &self,
+        destination: &Peer,
+        message_ids: &[i32],
+        source: &Peer,
+    ) -> Result<Vec<Message>> {
+        let destination_ref = to_peer_ref(destination).await?;
+        let source_ref = to_peer_ref(source).await?;
+
+        let messages = self
+            .client
+            .forward_messages(destination_ref, message_ids, source_ref)
+            .await
+            .context("failed to forward messages")?;
+
+        Ok(messages
+            .into_iter()
+            .flatten()
+            .map(|m| Message { inner: m })
+            .collect())
+    }
+
+    /// Pins a message in a peer (requires `can_pin_messages` for channels).
+    pub async fn pin_message(&self, peer: &Peer, message_id: i32) -> Result<()> {
+        let peer_ref = to_peer_ref(peer).await?;
+
+        self.client
+            .pin_message(peer_ref, message_id)
+            .await
+            .context("failed to pin message")?;
+
+        Ok(())
+    }
+
+    /// Returns the currently pinned message of a peer, if any.
+    pub async fn get_pinned_message(&self, peer: &Peer) -> Result<Option<Message>> {
+        let peer_ref = to_peer_ref(peer).await?;
+
+        let msg = self
+            .client
+            .get_pinned_message(peer_ref)
+            .await
+            .context("failed to fetch pinned message")?;
+
+        Ok(msg.map(|m| Message { inner: m }))
+    }
+
+    /// Returns the message with the given id, if it still exists.
+    pub async fn get_message(&self, peer: &Peer, message_id: i32) -> Result<Option<Message>> {
+        let peer_ref = to_peer_ref(peer).await?;
+
+        let messages = self
+            .client
+            .get_messages_by_id(peer_ref, &[message_id])
+            .await
+            .context("failed to fetch message")?;
+
+        Ok(messages.into_iter().flatten().next().map(|m| Message { inner: m }))
+    }
+
+    /// Returns which of the given message ids still exist in a peer, in order
+    /// (`None` for ids whose messages no longer exist).
+    pub async fn get_messages_by_id(
+        &self,
+        peer: &Peer,
+        message_ids: &[i32],
+    ) -> Result<Vec<Option<Message>>> {
+        let peer_ref = to_peer_ref(peer).await?;
+
+        let messages = self
+            .client
+            .get_messages_by_id(peer_ref, message_ids)
+            .await
+            .context("failed to fetch messages by id")?;
+
+        Ok(messages
+            .into_iter()
+            .map(|m| m.map(|m| Message { inner: m }))
+            .collect())
     }
 
     /// Deletes messages from a peer.
@@ -223,6 +358,16 @@ impl Message {
 
     pub fn id(&self) -> i32 {
         self.inner.id()
+    }
+
+    /// Whether the message no longer exists on the server. Deleted channel
+    /// messages come back from lookups as `MessageEmpty` placeholders (with the
+    /// requested id), so a presence check must treat those as gone.
+    pub fn is_deleted(&self) -> bool {
+        matches!(
+            self.inner.raw,
+            grammers_client::tl::enums::Message::Empty(_)
+        )
     }
 
     pub fn outgoing(&self) -> bool {

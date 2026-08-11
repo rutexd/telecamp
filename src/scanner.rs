@@ -4,7 +4,6 @@ use anyhow::Result;
 use tokio::time::sleep;
 
 use crate::config::Config;
-use crate::progress::NoopProgressSink;
 use crate::tg::{Peer, TgClient};
 use crate::AppState;
 
@@ -24,6 +23,8 @@ pub enum ReleaseAction {
     Seen,
     /// New but blacklisted; marked as seen, nothing posted.
     Blacklisted,
+    /// New but older than the configured age limit; marked as seen, nothing posted.
+    TooOld,
     /// New and posted to Telegram.
     Posted,
 }
@@ -32,15 +33,15 @@ pub enum ReleaseAction {
 pub async fn run(config: Config, state: Arc<AppState>, client: TgClient) -> Result<()> {
     let peer = client.resolve_chat(&config).await?;
 
-    if peer.is_none() {
-        log::warn!("neither TELEGRAM_CHANNEL nor TELEGRAM_CHAT_ID is set; new releases will be marked seen but not sent anywhere");
-    } else {
-        if let Err(err) = client
-            .send_message(peer.as_ref().unwrap(), startup_summary(&config))
-            .await
-        {
+    if let Some(chat) = &peer {
+        if let Err(err) = client.send_message(chat, startup_summary(&config)).await {
             log::error!("failed to post startup message: {err:#}");
         }
+        if let Err(err) = crate::menu::ensure_pinned_menu(&client, chat, &state).await {
+            log::error!("failed to ensure pinned menu: {err:#}");
+        }
+    } else {
+        log::warn!("neither TELEGRAM_CHANNEL nor TELEGRAM_CHAT_ID is set; new releases will be marked seen but not sent anywhere");
     }
 
     loop {
@@ -57,7 +58,7 @@ pub async fn run(config: Config, state: Arc<AppState>, client: TgClient) -> Resu
             Err(err) => log::error!("scan round failed: {err:#}"),
         }
 
-        sleep(config.poll_interval).await;
+        sleep(config.poll_interval()).await;
     }
 }
 
@@ -78,10 +79,25 @@ fn startup_summary(config: &Config) -> String {
     } else {
         config.bandcamp_artists.join(", ")
     };
+    let artist_blacklist = if config.bandcamp_artist_blacklist.is_empty() {
+        "—".to_string()
+    } else {
+        config.bandcamp_artist_blacklist.join(", ")
+    };
+    let max_age = if config.bandcamp_max_age_days == 0 {
+        "без ограничения".to_string()
+    } else {
+        format!("{} дн.", config.bandcamp_max_age_days)
+    };
+    let max_tracks = if config.bandcamp_max_tracks == 0 {
+        "без ограничения".to_string()
+    } else {
+        format!("до {} треков", config.bandcamp_max_tracks)
+    };
 
     format!(
-        "Бот запущен.\nТеги: {tags}\nАртисты: {artists}\nБлэклист: {blacklist}\nОпрос каждые {} с",
-        config.poll_interval.as_secs()
+        "Бот запущен.\nТеги: {tags}\nАртисты: {artists}\nБлэклист тегов: {blacklist}\nБлэклист артистов: {artist_blacklist}\nВозраст релиза: до {max_age}\nЛимит альбома: {max_tracks}\nОпрос каждые {} с",
+        config.poll_interval_seconds
     )
 }
 
@@ -105,19 +121,33 @@ pub async fn scan_round(
         };
         for release in releases {
             report.found += 1;
-            match process_release(client, state, config, &release.url, peer).await {
-                Ok(ReleaseAction::Seen) => {}
+            let posted = match process_release(client, state, config, &release.url, peer).await {
+                Ok(ReleaseAction::Seen) => false,
                 Ok(ReleaseAction::Blacklisted) => {
                     report.new += 1;
                     report.skipped += 1;
+                    false
+                }
+                Ok(ReleaseAction::TooOld) => {
+                    report.skipped += 1;
+                    false
                 }
                 Ok(ReleaseAction::Posted) => {
                     report.new += 1;
                     report.uploaded += 1;
+                    true
                 }
                 Err(err) => {
                     log::error!("failed to process {}: {err:#}", release.url);
+                    false
                 }
+            };
+            if posted {
+                // Pace album posts: uploads share the MTProto connection that
+                // carries updates, so back-to-back albums can make the server
+                // flush the update queue with updatesTooLong (a gap the update
+                // stream cannot always resolve).
+                sleep(config.post_album_delay()).await;
             }
         }
     }
@@ -133,19 +163,29 @@ pub async fn scan_round(
         };
         for release in releases {
             report.found += 1;
-            match process_release(client, state, config, &release.url, peer).await {
-                Ok(ReleaseAction::Seen) => {}
+            let posted = match process_release(client, state, config, &release.url, peer).await {
+                Ok(ReleaseAction::Seen) => false,
                 Ok(ReleaseAction::Blacklisted) => {
                     report.new += 1;
                     report.skipped += 1;
+                    false
+                }
+                Ok(ReleaseAction::TooOld) => {
+                    report.skipped += 1;
+                    false
                 }
                 Ok(ReleaseAction::Posted) => {
                     report.new += 1;
                     report.uploaded += 1;
+                    true
                 }
                 Err(err) => {
                     log::error!("failed to process {}: {err:#}", release.url);
+                    false
                 }
+            };
+            if posted {
+                sleep(config.post_album_delay()).await;
             }
         }
     }
@@ -166,11 +206,34 @@ async fn process_release(
         return Ok(ReleaseAction::Seen);
     }
 
-    let album = state.bandcamp.get_album(url).await?;
+    let album = match state.bandcamp.get_album(url).await {
+        Ok(album) => album,
+        Err(err) => {
+            // A 404 means the release was removed; it will never come back, so
+            // mark it seen instead of retrying it every round.
+            if err.to_string().contains("status 404") {
+                log::info!("marking {url} as seen: album no longer exists ({err:#})");
+                mark_seen(state, url);
+                return Ok(ReleaseAction::Seen);
+            }
+            return Err(err);
+        }
+    };
 
     // Re-check inside the lock holder after the slow fetch.
     if is_seen(state, url) {
         return Ok(ReleaseAction::Seen);
+    }
+
+    // Blacklisted artist: skip the album but never look at it again.
+    if crate::bandcamp::is_artist_blacklisted(&album.url, &config.bandcamp_artist_blacklist) {
+        log::info!(
+            "skipping '{} - {}' ({url}): artist is blacklisted",
+            album.artist,
+            album.title
+        );
+        mark_seen(state, url);
+        return Ok(ReleaseAction::Blacklisted);
     }
 
     // Blacklisted tag: skip the album but never look at it again.
@@ -184,6 +247,29 @@ async fn process_release(
         return Ok(ReleaseAction::Blacklisted);
     }
 
+    // Age limit: releases older than the cutoff never get younger, so mark
+    // them seen and skip.
+    if config.bandcamp_max_age_days > 0 {
+        let too_old = crate::bandcamp::release_date_unix(&album.release_date).map_or(false, |released| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0);
+            now.saturating_sub(released) > config.bandcamp_max_age_days * 86_400
+        });
+
+        if too_old {
+            log::info!(
+                "skipping '{} - {}' ({url}): released more than {} day(s) ago",
+                album.artist,
+                album.title,
+                config.bandcamp_max_age_days
+            );
+            mark_seen(state, url);
+            return Ok(ReleaseAction::TooOld);
+        }
+    }
+
     log::info!("new release: {} - {} ({url})", album.artist, album.title);
 
     let Some(peer) = peer else {
@@ -192,18 +278,7 @@ async fn process_release(
         return Ok(ReleaseAction::Seen);
     };
 
-    // Progress is intentionally disabled: per-event edits spam the chat and
-    // trip Telegram's flood limits (FLOOD_WAIT on editMessage).
-    let progress: Arc<dyn crate::progress::ProgressSink> = Arc::new(NoopProgressSink);
-
-    // Producer/consumer: the downloader streams tracks into a bounded channel
-    // while the uploader consumes and posts them one at a time.
-    let stream = state.downloader.stream(&album, progress.clone()).await?;
-
-    state
-        .uploader
-        .upload(client, peer, stream, progress.clone())
-        .await?;
+    crate::poster::post_album(client, peer, state, &album).await?;
 
     // Mark as seen
     mark_seen(state, url);

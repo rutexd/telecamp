@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context as AnyhowContext, Result};
 use async_trait::async_trait;
+use grammers_client::message::ReplyMarkup;
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::bandcamp::Album;
@@ -20,6 +21,10 @@ const MEDIA_GROUP_MAX: usize = 10;
 #[derive(Debug, Default)]
 pub struct UploadResult {
     pub sent_files: usize,
+    /// Message id of the preview (cover photo) message, if one was sent.
+    pub preview_message_id: Option<i32>,
+    /// Message ids of all posted track media groups.
+    pub album_message_ids: Vec<i32>,
 }
 
 /// Uploads an album streamed from the downloader (consumer side of the pipeline).
@@ -31,6 +36,7 @@ pub trait Uploader: Send + Sync {
         peer: &Peer,
         stream: AlbumStream,
         progress: Arc<dyn ProgressSink>,
+        markup: Option<ReplyMarkup>,
     ) -> Result<UploadResult>;
 }
 
@@ -46,6 +52,7 @@ impl Uploader for NoopUploader {
         peer: &Peer,
         stream: AlbumStream,
         _progress: Arc<dyn ProgressSink>,
+        _markup: Option<ReplyMarkup>,
     ) -> Result<UploadResult> {
         log::info!(
             "[noop] would upload {} track(s) of '{} - {}' to chat {}",
@@ -59,7 +66,10 @@ impl Uploader for NoopUploader {
         let mut tracks = stream.tracks;
         while tracks.recv().await.is_some() {}
 
-        Ok(UploadResult { sent_files: 0 })
+        Ok(UploadResult {
+            sent_files: 0,
+            ..Default::default()
+        })
     }
 }
 
@@ -80,15 +90,17 @@ impl Uploader for TelegramUploader {
         peer: &Peer,
         stream: AlbumStream,
         progress: Arc<dyn ProgressSink>,
+        markup: Option<ReplyMarkup>,
     ) -> Result<UploadResult> {
         let album = &stream.album;
         let summary = album_summary(album);
         let mut sent_files = 0;
+        let mut album_message_ids = Vec::new();
 
-        // Send cover photo with caption
-        match &stream.cover {
+        // Send cover photo with caption (and like/dislike buttons when requested)
+        let preview_message_id = match &stream.cover {
             Some(cover) => {
-                client.send_photo(peer, cover.clone(), summary).await?;
+                let msg = client.send_photo(peer, cover.clone(), summary, markup).await?;
                 sent_files += 1;
                 log::info!(
                     "posted cover of '{} - {}' to chat {}",
@@ -96,11 +108,16 @@ impl Uploader for TelegramUploader {
                     album.title,
                     peer.id()
                 );
+                Some(msg.id())
             }
             None => {
-                client.send_message(peer, summary).await?;
+                let msg = match markup {
+                    Some(markup) => client.send_message_markup(peer, summary, Some(markup)).await?,
+                    None => client.send_message(peer, summary).await?,
+                };
+                Some(msg.id())
             }
-        }
+        };
 
         // Upload thumbnail once
         let thumbnail = match stream.cover.as_deref().and_then(cover_thumbnail) {
@@ -215,7 +232,8 @@ impl Uploader for TelegramUploader {
             );
 
             if media.len() == MEDIA_GROUP_MAX {
-                client.send_album(peer, std::mem::take(&mut media)).await?;
+                let messages = client.send_album(peer, std::mem::take(&mut media)).await?;
+                album_message_ids.extend(messages.iter().map(|m| m.id()));
                 log::info!(
                     "posted {} track(s) of '{} - {}' to chat {}",
                     MEDIA_GROUP_MAX,
@@ -230,7 +248,8 @@ impl Uploader for TelegramUploader {
 
         if !media.is_empty() {
             let count = media.len();
-            client.send_album(peer, media).await?;
+            let messages = client.send_album(peer, media).await?;
+            album_message_ids.extend(messages.iter().map(|m| m.id()));
             log::info!(
                 "posted {} track(s) of '{} - {}' to chat {}",
                 count,
@@ -240,7 +259,11 @@ impl Uploader for TelegramUploader {
             );
         }
 
-        Ok(UploadResult { sent_files })
+        Ok(UploadResult {
+            sent_files,
+            preview_message_id,
+            album_message_ids,
+        })
     }
 }
 
@@ -268,8 +291,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
     }
 }
 
-/// Formats the album header message posted above the tracks.
-fn album_summary(album: &Album) -> String {
+/// Formats the album header message posted above the tracks (also reused for
+/// the caption of too-big albums, which only get their cover posted).
+pub(crate) fn album_summary(album: &Album) -> String {
     let mut text = format!("{} - {}\n", album.artist, album.title);
 
     if !album.release_date.is_empty() {

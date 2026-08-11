@@ -92,6 +92,10 @@ pub trait Downloader: Send + Sync {
     /// that feeds each track's audio chunks into a bounded channel. Returns
     /// immediately; the consumer drains [`AlbumStream::tracks`] at its own pace.
     async fn stream(&self, album: &Album, progress: Arc<dyn ProgressSink>) -> Result<AlbumStream>;
+
+    /// Fetches just the album cover art (no track streaming), if available.
+    /// Used when an album is too big to upload: only the cover is posted.
+    async fn fetch_cover(&self, album: &Album) -> Result<Option<Vec<u8>>>;
 }
 
 /// Carcase-only implementation: wires the pipeline together, does no real download.
@@ -116,6 +120,10 @@ impl Downloader for NoopDownloader {
             cover: None,
             tracks: rx,
         })
+    }
+
+    async fn fetch_cover(&self, _album: &Album) -> Result<Option<Vec<u8>>> {
+        Ok(None)
     }
 }
 
@@ -265,19 +273,7 @@ impl Downloader for HttpDownloader {
     ) -> Result<AlbumStream> {
         // The cover is needed for the summary photo and the per-track
         // thumbnails before any audio uploads, so fetch it up front.
-        let cover = match album.art_id {
-            Some(art_id) => {
-                let url = format!("https://f4.bcbits.com/img/a{art_id}_10.jpg");
-                match self.get_bytes(&url).await {
-                    Ok(bytes) => Some(bytes),
-                    Err(err) => {
-                        log::warn!("failed to fetch cover art {url}: {err:#}");
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
+        let cover = self.fetch_cover(album).await?;
 
         let (tx, rx) = mpsc::channel::<DownloadedTrack>(TRACK_QUEUE);
 
@@ -352,5 +348,20 @@ impl Downloader for HttpDownloader {
             cover,
             tracks: rx,
         })
+    }
+
+    async fn fetch_cover(&self, album: &Album) -> Result<Option<Vec<u8>>> {
+        let Some(art_id) = album.art_id else {
+            return Ok(None);
+        };
+
+        let url = format!("https://f4.bcbits.com/img/a{art_id}_10.jpg");
+        match self.get_bytes(&url).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(err) => {
+                log::warn!("failed to fetch cover art {url}: {err:#}");
+                Ok(None)
+            }
+        }
     }
 }

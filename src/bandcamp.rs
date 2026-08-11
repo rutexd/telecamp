@@ -413,6 +413,97 @@ fn strip_tracker(url: &str) -> String {
     url.split('?').next().unwrap_or(url).to_string()
 }
 
+/// Parses the two release-date formats Bandcamp uses into Unix seconds at
+/// 00:00 UTC of that date:
+/// - album page: `"11 Dec 2025 00:00:00 GMT"`
+/// - discover API: `"2026-08-05 00:00:00 UTC"`
+pub fn release_date_unix(release_date: &str) -> Option<u64> {
+    let parts: Vec<&str> = release_date.split_whitespace().collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let (year, month, day) = if parts[0].contains('-') {
+        let mut it = parts[0].split('-');
+        let year: i64 = it.next()?.parse().ok()?;
+        let month: u32 = it.next()?.parse().ok()?;
+        let day: u32 = it.next()?.parse().ok()?;
+        (year, month, day)
+    } else if parts.len() >= 3 {
+        let day: u32 = parts[0].parse().ok()?;
+        let month = month_from_abbr(parts[1])?;
+        let year: i64 = parts[2].parse().ok()?;
+        (year, month, day)
+    } else {
+        return None;
+    };
+
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    days_from_civil(year, month, day)
+        .checked_mul(86_400)?
+        .try_into()
+        .ok()
+}
+
+fn month_from_abbr(raw: &str) -> Option<u32> {
+    match raw.to_ascii_lowercase().as_str() {
+        "jan" => Some(1),
+        "feb" => Some(2),
+        "mar" => Some(3),
+        "apr" => Some(4),
+        "may" => Some(5),
+        "jun" => Some(6),
+        "jul" => Some(7),
+        "aug" => Some(8),
+        "sep" => Some(9),
+        "oct" => Some(10),
+        "nov" => Some(11),
+        "dec" => Some(12),
+        _ => None,
+    }
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian civil date
+/// (Howard Hinnant's `days_from_civil` algorithm).
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let z = year - i64::from(month <= 2);
+    let era = z.div_euclid(400);
+    let yoe = z - era * 400;
+    let offset = if month > 2 { -3 } else { 9 };
+    let doy = (153 * (i64::from(month) + offset) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The normalized host of an URL: `"https://foo.bandcamp.com/album/x"` ->
+/// `"foo.bandcamp.com"` (lowercase, `www.` stripped).
+pub fn url_host(url: &str) -> Option<String> {
+    let host = url
+        .trim()
+        .split("://")
+        .last()?
+        .split('/')
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    Some(host.to_string())
+}
+
+/// True if the album belongs to an artist whose site appears in `blacklist`.
+pub fn is_artist_blacklisted(album_url: &str, blacklist: &[String]) -> bool {
+    let Some(host) = url_host(album_url) else {
+        return false;
+    };
+    blacklist
+        .iter()
+        .filter_map(|entry| url_host(entry))
+        .any(|blocked| blocked == host)
+}
+
 /// Decodes the handful of HTML entities Bandcamp uses inside JSON attributes.
 ///
 /// html5ever may or may not decode attribute values depending on the parser;
@@ -587,6 +678,31 @@ mod tests {
         assert!(album.has_any_tag(&["sascha-müller".into()]));
         assert!(album.has_any_tag(&["ACID_TECHNO".into()]));
         assert!(!album.has_any_tag(&["house".into(), "minimal".into()]));
+    }
+
+    #[test]
+    fn parses_release_dates() {
+        assert_eq!(release_date_unix("11 Dec 2025 00:00:00 GMT"), Some(1765411200));
+        assert_eq!(release_date_unix("13 Mar 2013 00:00:00 GMT"), Some(1363132800));
+        assert_eq!(release_date_unix("2026-08-05 00:00:00 UTC"), Some(1785888000));
+        assert_eq!(release_date_unix("1970-01-01 00:00:00 UTC"), Some(0));
+        assert_eq!(release_date_unix("garbage"), None);
+        assert_eq!(release_date_unix(""), None);
+    }
+
+    #[test]
+    fn artist_blacklist_matches_host() {
+        let album_url = "https://derekchronicbaranekofficial.bandcamp.com/album/foo";
+
+        assert!(is_artist_blacklisted(
+            album_url,
+            &["https://derekchronicbaranekofficial.bandcamp.com".into()]
+        ));
+        assert!(is_artist_blacklisted(
+            album_url,
+            &["derekchronicbaranekofficial.bandcamp.com/".into()]
+        ));
+        assert!(!is_artist_blacklisted(album_url, &["other.bandcamp.com".into()]));
     }
 
     #[test]
