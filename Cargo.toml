@@ -1,6 +1,6 @@
 [package]
 name = "telecamp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 default-run = "telecamp"
 
@@ -11,7 +11,7 @@ clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
 env_logger = "0.11"
 image = { version = "0.24", default-features = false, features = ["jpeg"] }
-impersonate-rs = { git = "https://github.com/rutexd/impersonate-rs", rev = "b2c703194c7be86a6ab81c0ae8c1fe6adbb2f1d3" }
+impersonate-rs = { git = "https://github.com/rutexd/impersonate-rs", rev = "ea3863e" }
 log = "0.4"
 percent-encoding = "2"
 grammers-client = "0.10"
