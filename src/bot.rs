@@ -340,7 +340,13 @@ async fn handle_dislike(
     // Collect every message of the album (preview + all track groups). The
     // liked entry also carries the ids and survives the 30-day registry prune,
     // so union both sources to cover every posted message.
-    let ids = collect_album_message_ids(post.as_ref(), liked.as_ref());
+    //
+    // The message whose button was pressed is always added on top: a crash
+    // between the cover post and the record save (or between two posts) leaves
+    // an orphaned cover that shares the callback token with the later, written
+    // record, so deleting must remove that cover too - not just the recorded
+    // messages. Without any record the pressed cover is the only known message.
+    let ids = collect_delete_ids(post.as_ref(), liked.as_ref(), callback_message_id(query));
 
     if ids.is_empty() {
         query.answer().text("Запись не найдена").send().await?;
@@ -348,11 +354,11 @@ async fn handle_dislike(
     }
 
     // The vote history wants a post record; rebuild one from the liked entry
-    // when the registry record has already been pruned.
-    let vote_post = if let Some(post) = &post {
-        post.clone()
-    } else if let Some(entry) = &liked {
-        PostRecord {
+    // when the registry record has already been pruned. An orphaned cover
+    // without any record has no album metadata to attribute, so no vote is
+    // recorded for it.
+    let vote_post = post.clone().or_else(|| {
+        liked.map(|entry| PostRecord {
             token: entry.token.clone(),
             url: entry.url.clone(),
             artist: entry.artist.clone(),
@@ -361,16 +367,16 @@ async fn handle_dislike(
             preview_msg_id: entry.preview_msg_id,
             album_msg_ids: entry.album_msg_ids.clone(),
             posted_at_unix: crate::store::now_unix(),
-        }
-    } else {
-        unreachable!("a non-empty id list implies a matching record")
-    };
-    record_vote(
-        state,
-        query.sender_id().bare_id().unwrap_or(0),
-        "dislike",
-        &vote_post,
-    );
+        })
+    });
+    if let Some(vote_post) = &vote_post {
+        record_vote(
+            state,
+            query.sender_id().bare_id().unwrap_or(0),
+            "dislike",
+            vote_post,
+        );
+    }
 
     // Delete with retries and verification: a big album produces many messages
     // and a dislike often lands right after the upload, so the first call may
@@ -453,6 +459,34 @@ fn collect_album_message_ids(
     ids
 }
 
+/// The id of the message whose inline button was pressed, if any. Unknown for
+/// inline-mode queries (not used here).
+fn callback_message_id(query: &CallbackQuery) -> Option<i32> {
+    match &query.raw {
+        grammers_client::tl::enums::Update::BotCallbackQuery(update) => Some(update.msg_id),
+        _ => None,
+    }
+}
+
+/// Every message of the album to delete for a dislike: the recorded messages
+/// (preview + track groups) unioned with the message the button was pressed on.
+/// The pressed message matters because a crash between the cover post and the
+/// record save leaves an orphaned cover (same callback token) that no record
+/// knows about; deleting must still reach it.
+fn collect_delete_ids(
+    post: Option<&PostRecord>,
+    liked: Option<&LikedEntry>,
+    pressed: Option<i32>,
+) -> Vec<i32> {
+    let mut ids = collect_album_message_ids(post, liked);
+    if let Some(pressed) = pressed {
+        if pressed > 0 && !ids.contains(&pressed) {
+            ids.push(pressed);
+        }
+    }
+    ids
+}
+
 /// Deletes every message in `ids`, retrying transient failures and re-checking
 /// what actually got deleted, so a partial or flood-limited delete is completed.
 /// Returns the ids that could not be deleted.
@@ -519,35 +553,51 @@ async fn handle_forward(
         return Ok(());
     };
 
-    // Forward the whole album: the preview (cover) plus every track media
-    // group, so the repost carries the tracks and not just the artwork.
-    let post = state.posts.lock().unwrap().get(token).cloned();
-    let mut ids: Vec<i32> = Vec::new();
-    if entry.preview_msg_id > 0 {
-        ids.push(entry.preview_msg_id);
+    // The favorite stores a reference to the album: its Bandcamp URL plus the
+    // ids of the posted messages. As long as those messages still exist the
+    // album is re-posted by forwarding them (cheap); once they are gone the
+    // reference degrades to the URL alone, and the album is fetched from
+    // Bandcamp and uploaded again.
+    let ids = liked_album_ids(state, &entry);
+
+    // Probe which of the stored messages are still on the server: deleted
+    // channel messages come back as `MessageEmpty` placeholders, so an id whose
+    // message is gone must not be forwarded. On a probe error fall back to
+    // forwarding everything (the old behaviour).
+    let alive_ids: Vec<i32> = match client.get_messages_by_id(peer, &ids).await {
+        Ok(messages) => ids
+            .iter()
+            .zip(messages)
+            .filter(|(_, msg)| matches!(msg, Some(m) if !m.is_deleted()))
+            .map(|(id, _)| *id)
+            .collect(),
+        Err(err) => {
+            log::warn!("failed to probe liked album messages, forwarding all: {err:#}");
+            ids.clone()
+        }
+    };
+
+    // The album counts as deleted when nothing survives, or when its cover (the
+    // message the forward lives on) is gone.
+    let preview_alive = entry.preview_msg_id > 0 && alive_ids.contains(&entry.preview_msg_id);
+    if alive_ids.is_empty() || !preview_alive {
+        return reupload_liked_album(client, state, query, peer, token, &entry).await;
     }
 
-    // Older favorites (saved before the track ids were persisted) fall back
-    // to the post registry; when found there, backfill the favorite so it
-    // stays self-contained after the registry is pruned.
-    if !entry.album_msg_ids.is_empty() {
-        ids.extend(entry.album_msg_ids.iter().copied().filter(|id| *id > 0));
-    } else if let Some(post) = &post {
-        ids.extend(post.album_msg_ids.iter().copied().filter(|id| *id > 0));
-        {
-            let mut liked = state.liked.lock().unwrap();
-            if let Some(stored) = liked.get_mut(token) {
-                stored.album_msg_ids = post.album_msg_ids.clone();
+    // Drop the dead ids from the favorite so later forwards do not retry them.
+    if alive_ids.len() != ids.len() {
+        let mut liked = state.liked.lock().unwrap();
+        if let Some(stored) = liked.get_mut(token) {
+            stored.album_msg_ids.retain(|id| alive_ids.contains(id));
+            if let Err(err) = liked.save() {
+                log::error!("failed to persist favorites after forward: {err:#}");
             }
         }
     }
 
-    if ids.is_empty() {
-        query.answer().text("Нет сообщений для пересылки").send().await?;
-        return Ok(());
-    }
-
-    match client.forward_messages(peer, &ids, peer).await {
+    // Forward the whole album: the preview (cover) plus every track media
+    // group, so the repost carries the tracks and not just the artwork.
+    match client.forward_messages(peer, &alive_ids, peer).await {
         Ok(_) => {
             query.answer().text("Переслано в канал").send().await?;
         }
@@ -556,6 +606,96 @@ async fn handle_forward(
             query.answer().text("Не удалось переслать").send().await?;
         }
     }
+
+    Ok(())
+}
+
+/// Collects the stored message ids of a liked album: the favorite's own ids,
+/// falling back to (and backfilling from) the post registry for favorites saved
+/// before track ids were persisted.
+fn liked_album_ids(state: &AppState, entry: &LikedEntry) -> Vec<i32> {
+    let post = state.posts.lock().unwrap().get(&entry.token).cloned();
+
+    let mut ids: Vec<i32> = Vec::new();
+    if entry.preview_msg_id > 0 {
+        ids.push(entry.preview_msg_id);
+    }
+
+    if !entry.album_msg_ids.is_empty() {
+        ids.extend(entry.album_msg_ids.iter().copied().filter(|id| *id > 0));
+    } else if let Some(post) = &post {
+        ids.extend(post.album_msg_ids.iter().copied().filter(|id| *id > 0));
+        if let Some(stored) = state.liked.lock().unwrap().get_mut(&entry.token) {
+            stored.album_msg_ids = post.album_msg_ids.clone();
+        }
+    }
+
+    ids
+}
+
+/// Re-uploads a liked album whose messages were deleted: fetches the album from
+/// Bandcamp by its stored URL (the remaining reference), posts it like a new
+/// release, and refreshes the favorite with the new message ids.
+async fn reupload_liked_album(
+    client: &TgClient,
+    state: &AppState,
+    query: &CallbackQuery,
+    peer: &Peer,
+    token: &str,
+    entry: &LikedEntry,
+) -> Result<()> {
+    log::info!(
+        "liked album '{} - {}' ({}) has no live messages; re-uploading",
+        entry.artist,
+        entry.title,
+        entry.url
+    );
+
+    let album = match state.bandcamp.get_album(&entry.url).await {
+        Ok(album) => album,
+        Err(err) => {
+            log::error!("failed to fetch liked album for re-upload {}: {err:#}", entry.url);
+            query
+                .answer()
+                .text("Не удалось перезалить альбом (Bandcamp недоступен)")
+                .send()
+                .await?;
+            return Ok(());
+        }
+    };
+
+    if let Err(err) = crate::poster::post_album(client, peer, state, &album).await {
+        log::error!("failed to re-upload liked album {}: {err:#}", entry.url);
+        query
+            .answer()
+            .text("Не удалось перезалить альбом")
+            .send()
+            .await?;
+        return Ok(());
+    }
+
+    // The re-post wrote a fresh record under the same token; copy its message
+    // ids into the favorite so the next forward has live references again.
+    let (preview_msg_id, album_msg_ids) = {
+        let posts = state.posts.lock().unwrap();
+        match posts.get(token) {
+            Some(record) => (record.preview_msg_id, record.album_msg_ids.clone()),
+            None => (0, Vec::new()),
+        }
+    };
+
+    {
+        let mut liked = state.liked.lock().unwrap();
+        if let Some(stored) = liked.get_mut(token) {
+            stored.preview_msg_id = preview_msg_id;
+            stored.album_msg_ids = album_msg_ids;
+        }
+        if let Err(err) = liked.save() {
+            log::error!("failed to persist favorites after re-upload: {err:#}");
+        }
+    }
+
+    query.answer().text("Перезалито в канал").send().await?;
 
     Ok(())
 }
@@ -731,5 +871,96 @@ mod tests {
 
         // Nothing known: empty.
         assert!(collect_album_message_ids(None, None).is_empty());
+    }
+
+    #[test]
+    fn collect_delete_ids_always_includes_pressed_message() {
+        // Orphaned cover from a crash (no record anywhere): the pressed message
+        // is the only known one, so it must still be deletable.
+        assert_eq!(collect_delete_ids(None, None, Some(50)), vec![50]);
+
+        let post = post_record("abc", 10, &[11, 12]);
+
+        // Pressed message already recorded: deduplicated, order unchanged.
+        assert_eq!(
+            collect_delete_ids(Some(&post), None, Some(10)),
+            vec![10, 11, 12]
+        );
+
+        // Missing/zero pressed message leaves the recorded set unchanged.
+        assert_eq!(collect_delete_ids(Some(&post), None, None), vec![10, 11, 12]);
+        assert_eq!(collect_delete_ids(Some(&post), None, Some(0)), vec![10, 11, 12]);
+
+        // The failed post's cover (same token, not in the record): appended so
+        // the re-post's dislike deletes the orphaned cover as well.
+        assert_eq!(
+            collect_delete_ids(Some(&post), None, Some(99)),
+            vec![10, 11, 12, 99]
+        );
+    }
+
+    fn test_app_state(dir: &std::path::Path) -> AppState {
+        AppState {
+            bandcamp: crate::bandcamp::BandcampClient::new(),
+            cache: Mutex::new(
+                crate::cache::SeenCache::open(dir.join("seen.json")).unwrap(),
+            ),
+            downloader: Box::new(crate::downloader::NoopDownloader),
+            uploader: Box::new(crate::uploader::NoopUploader),
+            tag_blacklist: vec![],
+            liked: Mutex::new(LikedStore::open(dir.join("favorites.json")).unwrap()),
+            posts: Mutex::new(PostRegistry::open(dir.join("posts.json")).unwrap()),
+            votes: Mutex::new(VoteLog::open(dir.join("votes.json")).unwrap()),
+            menu_id: Mutex::new(None),
+            menu_page: Mutex::new(0),
+            max_tracks: 0,
+            uploading: Mutex::new(HashSet::new()),
+            posting: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    #[test]
+    fn liked_album_ids_falls_back_to_registry_and_backfills() {
+        let dir = std::env::temp_dir().join(format!("telecamp-liked-ids-{}", std::process::id()));
+        let state = test_app_state(&dir);
+
+        // Old favorite saved before track ids were persisted: the ids come from
+        // the post registry and are copied into the favorite.
+        let entry = LikedEntry {
+            token: "abc".into(),
+            url: "https://x.bandcamp.com/album/y".into(),
+            artist: "Artist".into(),
+            title: "Album".into(),
+            preview_msg_id: 10,
+            album_msg_ids: vec![],
+            liked_at_unix: 1,
+        };
+        state.liked.lock().unwrap().insert(entry.clone());
+        state
+            .posts
+            .lock()
+            .unwrap()
+            .insert(post_record("abc", 10, &[11, 12]));
+
+        let ids = liked_album_ids(&state, &entry);
+        assert_eq!(ids, vec![10, 11, 12]);
+        assert_eq!(
+            state.liked.lock().unwrap().get("abc").unwrap().album_msg_ids,
+            vec![11, 12]
+        );
+
+        // Favorite with its own ids does not need the registry.
+        let entry = LikedEntry {
+            token: "def".into(),
+            url: "https://x.bandcamp.com/album/z".into(),
+            artist: "Artist".into(),
+            title: "Album".into(),
+            preview_msg_id: 20,
+            album_msg_ids: vec![21, 22],
+            liked_at_unix: 1,
+        };
+        assert_eq!(liked_album_ids(&state, &entry), vec![20, 21, 22]);
+
+        std::fs::remove_dir_all(dir).ok();
     }
 }
