@@ -114,16 +114,7 @@ impl BandcampClient {
     ///
     /// `slice` is "new", "top" or "rand"; only the first page is returned.
     pub async fn discover(&self, tags: &[String], slice: &str) -> Result<Vec<ReleaseRef>> {
-        let payload = serde_json::json!({
-            "category_id": 0,
-            "tag_norm_names": tags,
-            "geoname_id": 0,
-            "slice": slice,
-            "time_facet_id": null,
-            "cursor": null,
-            "size": 40,
-            "include_result_types": ["a"],
-        });
+        let payload = discover_payload(tags, slice);
 
         info!("discovering newest releases for tags {tags:?} ({slice})");
         let response: DiscoverResponse = self.post_json(DISCOVER_URL, payload).await?;
@@ -237,6 +228,19 @@ impl BandcampClient {
         .await
         .context("bandcamp fetch task panicked")?
     }
+}
+
+fn discover_payload(tags: &[String], slice: &str) -> serde_json::Value {
+    serde_json::json!({
+        "category_id": 0,
+        "tag_norm_names": tags,
+        "geoname_id": 0,
+        "slice": slice,
+        "time_facet_id": null,
+        "cursor": null,
+        "size": 40,
+        "include_result_types": ["a"],
+    })
 }
 
 /// Extracts the album data embedded into a Bandcamp album page.
@@ -589,6 +593,7 @@ struct DiscoverResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DiscoverResult {
     item_id: u64,
     band_id: u64,
@@ -601,6 +606,7 @@ struct DiscoverResult {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PrimaryImage {
     image_id: u64,
 }
@@ -748,5 +754,82 @@ mod tests {
             resolve_url("https://a.bandcamp.com", "https://other.bandcamp.com/album/x"),
             "https://other.bandcamp.com/album/x"
         );
+    }
+
+    #[test]
+    fn parses_discover_api_response() {
+        // A minimal snippet of the real /api/discover/1/discover_web response
+        // for the `noise` tag. Bandcamp switched the discover API from
+        // snake_case field names (item_id) to camelCase (itemId, releaseDate,
+        // trackCount, primaryImage.imageId), which is why the old struct
+        // raised "missing field `item_id`".
+        let json = r#"{
+            "results": [{
+                "itemId": 2708466368,
+                "itemType": "a",
+                "resultType": "a",
+                "title": "Test Album",
+                "itemUrl": "https://example.bandcamp.com/album/test?from=discover_page",
+                "primaryImage": {"imageId": 3998952672, "isArt": true},
+                "bandId": 1206223482,
+                "bandName": "Test Band",
+                "releaseDate": "2026-11-07 00:00:00 UTC",
+                "trackCount": 2
+            }]
+        }"#;
+
+        let response: DiscoverResponse = serde_json::from_str(json).unwrap();
+        let result = &response.results[0];
+
+        assert_eq!(result.item_id, 2708466368);
+        assert_eq!(result.band_id, 1206223482);
+        assert_eq!(result.band_name, "Test Band");
+        assert_eq!(result.title, "Test Album");
+        assert_eq!(
+            result.item_url,
+            "https://example.bandcamp.com/album/test?from=discover_page"
+        );
+        assert_eq!(result.release_date.as_deref(), Some("2026-11-07 00:00:00 UTC"));
+        assert_eq!(result.track_count, Some(2));
+        assert_eq!(
+            result.primary_image.as_ref().map(|image| image.image_id),
+            Some(3998952672)
+        );
+    }
+
+    #[test]
+    fn builds_discover_request_and_parses_hardcoded_album() {
+        let request = discover_payload(&["noise".to_string()], "new");
+
+        assert_eq!(request["category_id"], 0);
+        assert_eq!(request["tag_norm_names"], serde_json::json!(["noise"]));
+        assert_eq!(request["slice"], "new");
+        assert_eq!(request["size"], 40);
+        assert_eq!(request["include_result_types"], serde_json::json!(["a"]));
+
+        let response = serde_json::from_str::<DiscoverResponse>(
+            r#"{
+                "results": [{
+                    "itemId": 2708466368,
+                    "itemType": "a",
+                    "resultType": "a",
+                    "title": "Test Album",
+                    "itemUrl": "https://example.bandcamp.com/album/test?from=discover_page",
+                    "primaryImage": {"imageId": 3998952672, "isArt": true},
+                    "bandId": 1206223482,
+                    "bandName": "Test Band",
+                    "releaseDate": "2026-11-07 00:00:00 UTC",
+                    "trackCount": 2
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let album = response.results.into_iter().next().unwrap();
+        assert_eq!(album.item_id, 2708466368);
+        assert_eq!(album.title, "Test Album");
+        assert_eq!(album.band_name, "Test Band");
+        assert_eq!(album.item_url, "https://example.bandcamp.com/album/test?from=discover_page");
+        assert_eq!(album.track_count, Some(2));
     }
 }
